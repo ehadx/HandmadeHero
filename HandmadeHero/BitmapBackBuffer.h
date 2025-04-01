@@ -79,6 +79,6 @@ ResizeDIBSection(BitmapBackBuffer* buf, LONG width, LONG height)
     buf->info.bmiHeader.biCompression = BI_RGB;
 
     LONG bitmapMemorySize = buf->width * buf->height * BYTES_PER_PIXEL;
-    buf->mem = VirtualAlloc(0, bitmapMemorySize, MEM_COMMIT, PAGE_READWRITE);
+    buf->mem = VirtualAlloc(0, bitmapMemorySize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 

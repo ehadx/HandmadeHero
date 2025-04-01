@@ -21,12 +21,17 @@ X_INPUT_SET_STATE(XInputSetStateStub)
     return ERROR_DEVICE_NOT_CONNECTED;
 }
 
-static bool Running;
-static BitmapBackBuffer buf;
 static XInputSetState_* XInputSetState__;
 static XInputGetState_* XInputGetState__;
 
-static void LoadXInput(void)
+#define DIRECT_SOUND_CREATE(name) HRESULT WINAPI name(LPCGUID pcGuidDevice, LPDIRECTSOUND* ppDS, LPUNKNOWN pUnkOuter)
+typedef DIRECT_SOUND_CREATE(DirectSoundCreate_);
+
+static bool Running;
+static BitmapBackBuffer buf;
+
+static void 
+LoadXInput(void)
 {
 	HMODULE xInputLibrary = LoadLibraryA("xinput1_4.dll");
 	if (!xInputLibrary) xInputLibrary = LoadLibraryA("xinput9_1_0.dll");
@@ -40,6 +45,80 @@ static void LoadXInput(void)
 		XInputGetState__ = xInputGetState;
 		XInputSetState__ = xInputSetState;
 	}
+}
+
+static void
+InitDirectSound(HWND hWnd, int32_t samplesPerSec, int32_t bufferSize)
+{
+	HMODULE directSoundLibrary = LoadLibraryA("dsound.dll");
+    if (!directSoundLibrary)
+	{
+		return;
+	}
+
+	DirectSoundCreate_* directSoundCreate = (DirectSoundCreate_*)
+		GetProcAddress(directSoundLibrary, "DirectSoundCreate");
+
+	LPDIRECTSOUND directSound = NULL;
+	if (!directSoundCreate || !SUCCEEDED(directSoundCreate(0, &directSound, 0)))
+	{
+        OutputDebugStringA("Cannot initialize direct sound\n");
+		return;
+	}
+
+	if (!SUCCEEDED(directSound->lpVtbl->SetCooperativeLevel(directSound, hWnd, DSSCL_PRIORITY)))
+	{
+        OutputDebugStringA("Cannot set cooperative level\n");
+		return;
+	}
+	
+	DSBUFFERDESC priBufferDesc = {
+        .dwSize = sizeof(priBufferDesc),
+        .dwFlags = DSBCAPS_PRIMARYBUFFER,
+    };
+
+    // all this is doing is getting a handle to the primary sound card so we can set
+    // its format which puts the sound card into a mode that allows it to play in the
+	// format we want
+	LPDIRECTSOUNDBUFFER primaryBuffer = NULL;
+	if (!SUCCEEDED(directSound->lpVtbl->CreateSoundBuffer(directSound, &priBufferDesc, &primaryBuffer, 0)))
+	{
+        OutputDebugStringA("Cannot create primary buffer\n");
+		return;
+	}
+
+    WAVEFORMATEX waveFormat = { 0 };
+	waveFormat.cbSize = 0; 
+	waveFormat.wFormatTag = WAVE_FORMAT_PCM;  
+	waveFormat.nChannels = 2;  
+	waveFormat.nSamplesPerSec = samplesPerSec;  
+	waveFormat.wBitsPerSample = 16;  
+	waveFormat.nBlockAlign = waveFormat.nChannels * waveFormat.wBitsPerSample / 8;  
+	waveFormat.nAvgBytesPerSec = waveFormat.nSamplesPerSec * waveFormat.nBlockAlign;
+    
+    if (!SUCCEEDED(primaryBuffer->lpVtbl->SetFormat(primaryBuffer, &waveFormat)))
+    {
+        OutputDebugStringA("Cannot set primary buffer format\n");
+        return;
+    }
+
+	DSBUFFERDESC secBufferDesc = {
+        .dwSize = sizeof(secBufferDesc),
+        .dwBufferBytes = bufferSize,
+		.lpwfxFormat = &waveFormat,
+    };
+
+	// the buffer we actually write to, we are not allowed in these days to write to the
+	// primary buffer, which will write directly to the sound card, this is why we need
+    // a secondary buffer.
+	LPDIRECTSOUNDBUFFER secondaryBuffer = NULL;
+	if (!SUCCEEDED(directSound->lpVtbl->CreateSoundBuffer(directSound, &secBufferDesc, &secondaryBuffer, 0)))
+	{
+        OutputDebugStringA("Cannot create secondary buffer\n");
+		return;
+	}
+
+    OutputDebugStringA("DIRECT SOUND INITIALIZED\n");
 }
 
 typedef struct
@@ -211,6 +290,7 @@ wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR
     int xoffset = 0, yoffset = 0;
     HDC drawCtx = GetDC(hWnd);
 
+	InitDirectSound(hWnd, 48000, 48000 * sizeof(int16_t) * 2);
     ResizeDIBSection(&buf, 1200, 720);
     LoadXInput();
     while (Running)
@@ -252,19 +332,19 @@ wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR
                 xoffset += lStickX >> 12;
 				yoffset += lStickY >> 12;
 
-				UNREFERENCED_PARAMETER(up);
-				UNREFERENCED_PARAMETER(down);
-				UNREFERENCED_PARAMETER(left);
-				UNREFERENCED_PARAMETER(right);
-				UNREFERENCED_PARAMETER(start);
-				UNREFERENCED_PARAMETER(back);
-				UNREFERENCED_PARAMETER(leftShoulder);
-				UNREFERENCED_PARAMETER(rightShoulder);
-				UNREFERENCED_PARAMETER(bButton);
-				UNREFERENCED_PARAMETER(aButton);
-				UNREFERENCED_PARAMETER(xButton);
-				UNREFERENCED_PARAMETER(yButton);
-			}
+                DBG_UNREFERENCED_LOCAL_VARIABLE(up);
+                DBG_UNREFERENCED_LOCAL_VARIABLE(down);
+                DBG_UNREFERENCED_LOCAL_VARIABLE(left);
+                DBG_UNREFERENCED_LOCAL_VARIABLE(right);
+                DBG_UNREFERENCED_LOCAL_VARIABLE(start);
+                DBG_UNREFERENCED_LOCAL_VARIABLE(back);
+                DBG_UNREFERENCED_LOCAL_VARIABLE(leftShoulder);
+                DBG_UNREFERENCED_LOCAL_VARIABLE(rightShoulder);
+                DBG_UNREFERENCED_LOCAL_VARIABLE(bButton);
+                DBG_UNREFERENCED_LOCAL_VARIABLE(aButton);
+                DBG_UNREFERENCED_LOCAL_VARIABLE(xButton);
+                DBG_UNREFERENCED_LOCAL_VARIABLE(yButton);
+            }
 			else
 			{
 				// This controller is not available
