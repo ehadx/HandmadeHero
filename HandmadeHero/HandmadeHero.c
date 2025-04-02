@@ -27,8 +27,9 @@ static XInputGetState_* XInputGetState__;
 #define DIRECT_SOUND_CREATE(name) HRESULT WINAPI name(LPCGUID pcGuidDevice, LPDIRECTSOUND* ppDS, LPUNKNOWN pUnkOuter)
 typedef DIRECT_SOUND_CREATE(DirectSoundCreate_);
 
-static bool Running;
-static BitmapBackBuffer buf;
+static bool TheIsGameRunning;
+static BitmapBackBuffer ThePixelBuffer;
+static LPDIRECTSOUNDBUFFER TheSoundBuffer;
 
 static void 
 LoadXInput(void)
@@ -53,6 +54,7 @@ InitDirectSound(HWND hWnd, int32_t samplesPerSec, int32_t bufferSize)
 	HMODULE directSoundLibrary = LoadLibraryA("dsound.dll");
     if (!directSoundLibrary)
 	{
+		OutputDebugStringA("Could not load dsound.dll\n");
 		return;
 	}
 
@@ -66,7 +68,7 @@ InitDirectSound(HWND hWnd, int32_t samplesPerSec, int32_t bufferSize)
 		return;
 	}
 
-	if (!SUCCEEDED(directSound->lpVtbl->SetCooperativeLevel(directSound, hWnd, DSSCL_PRIORITY)))
+	if (!SUCCEEDED(IDirectSound_SetCooperativeLevel(directSound, hWnd, DSSCL_PRIORITY)))
 	{
         OutputDebugStringA("Cannot set cooperative level\n");
 		return;
@@ -81,7 +83,7 @@ InitDirectSound(HWND hWnd, int32_t samplesPerSec, int32_t bufferSize)
     // its format which puts the sound card into a mode that allows it to play in the
 	// format we want
 	LPDIRECTSOUNDBUFFER primaryBuffer = NULL;
-	if (!SUCCEEDED(directSound->lpVtbl->CreateSoundBuffer(directSound, &priBufferDesc, &primaryBuffer, 0)))
+	if (!SUCCEEDED(IDirectSound_CreateSoundBuffer(directSound, &priBufferDesc, &primaryBuffer, 0)))
 	{
         OutputDebugStringA("Cannot create primary buffer\n");
 		return;
@@ -96,7 +98,7 @@ InitDirectSound(HWND hWnd, int32_t samplesPerSec, int32_t bufferSize)
 	waveFormat.nBlockAlign = waveFormat.nChannels * waveFormat.wBitsPerSample / 8;  
 	waveFormat.nAvgBytesPerSec = waveFormat.nSamplesPerSec * waveFormat.nBlockAlign;
     
-    if (!SUCCEEDED(primaryBuffer->lpVtbl->SetFormat(primaryBuffer, &waveFormat)))
+    if (!SUCCEEDED(IDirectSoundBuffer_SetFormat(primaryBuffer, &waveFormat)))
     {
         OutputDebugStringA("Cannot set primary buffer format\n");
         return;
@@ -111,8 +113,7 @@ InitDirectSound(HWND hWnd, int32_t samplesPerSec, int32_t bufferSize)
 	// the buffer we actually write to, we are not allowed in these days to write to the
 	// primary buffer, which will write directly to the sound card, this is why we need
     // a secondary buffer.
-	LPDIRECTSOUNDBUFFER secondaryBuffer = NULL;
-	if (!SUCCEEDED(directSound->lpVtbl->CreateSoundBuffer(directSound, &secBufferDesc, &secondaryBuffer, 0)))
+	if (!SUCCEEDED(IDirectSound_CreateSoundBuffer(directSound, &secBufferDesc, &TheSoundBuffer, 0)))
 	{
         OutputDebugStringA("Cannot create secondary buffer\n");
 		return;
@@ -152,7 +153,7 @@ WindowPaintHandler(HWND hWnd)
     PAINTSTRUCT paint;
     HDC deviceContext = BeginPaint(hWnd, &paint);
     RECT pRect = paint.rcPaint;
-    DisplayBufferInWindow(&buf, dimension.width, dimension.height, deviceContext);
+    DisplayBufferInWindow(&ThePixelBuffer, dimension.width, dimension.height, deviceContext);
     EndPaint(hWnd, &paint);
 }
 
@@ -205,7 +206,7 @@ WindowKeyboardHandler(HWND hWnd, WPARAM wParam, LPARAM lParam)
 	bool altKeyIsDown = (lParam & (1ll << 29)) != 0;
     if (code == VK_F4 && altKeyIsDown)
     {
-		Running = false;
+		TheIsGameRunning = false;
     }
 }
 
@@ -223,12 +224,12 @@ WindowProcedure(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
     case WM_DESTROY:
         // handle this with an error
-        Running = false;
+        TheIsGameRunning = false;
         break;
 
     case WM_CLOSE:
         // handle this with a message to the user
-        Running = false;
+        TheIsGameRunning = false;
         break;
 
     case WM_ACTIVATEAPP:
@@ -252,6 +253,57 @@ WindowProcedure(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
 
     return result;
+}
+
+static void
+XInputLoop(int *xoffset, int *yoffset)
+{
+	// Should we poll this more frequently?
+	for (DWORD ctrlIdx = 0; ctrlIdx  < XUSER_MAX_COUNT; ctrlIdx++)
+	{
+		XINPUT_STATE controllerState;
+		if (XInputGetStateStub(ctrlIdx, &controllerState) == ERROR_SUCCESS)
+		{
+			// This controller is plugged in
+			// See if ControllerState dwPacketNumber increments too rapidly
+			XINPUT_GAMEPAD* pad = &controllerState.Gamepad;
+			bool up = pad->wButtons & XINPUT_GAMEPAD_DPAD_UP;
+			bool down = pad->wButtons & XINPUT_GAMEPAD_DPAD_DOWN;
+			bool left = pad->wButtons & XINPUT_GAMEPAD_DPAD_LEFT;
+			bool right = pad->wButtons & XINPUT_GAMEPAD_DPAD_RIGHT;
+			bool start = pad->wButtons & XINPUT_GAMEPAD_START;
+			bool back = pad->wButtons & XINPUT_GAMEPAD_BACK;
+			bool leftShoulder = pad->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER;
+			bool rightShoulder = pad->wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER;
+			bool aButton = pad->wButtons & XINPUT_GAMEPAD_A;
+			bool bButton = pad->wButtons & XINPUT_GAMEPAD_B;
+			bool xButton = pad->wButtons & XINPUT_GAMEPAD_X;
+			bool yButton = pad->wButtons & XINPUT_GAMEPAD_Y;
+
+			int16_t lStickX = pad->sThumbLX;
+			int16_t lStickY = pad->sThumbLY;
+
+			*xoffset += lStickX >> 12;
+			*yoffset += lStickY >> 12;
+
+			DBG_UNREFERENCED_LOCAL_VARIABLE(up);
+			DBG_UNREFERENCED_LOCAL_VARIABLE(down);
+			DBG_UNREFERENCED_LOCAL_VARIABLE(left);
+			DBG_UNREFERENCED_LOCAL_VARIABLE(right);
+			DBG_UNREFERENCED_LOCAL_VARIABLE(start);
+			DBG_UNREFERENCED_LOCAL_VARIABLE(back);
+			DBG_UNREFERENCED_LOCAL_VARIABLE(leftShoulder);
+			DBG_UNREFERENCED_LOCAL_VARIABLE(rightShoulder);
+			DBG_UNREFERENCED_LOCAL_VARIABLE(bButton);
+			DBG_UNREFERENCED_LOCAL_VARIABLE(aButton);
+			DBG_UNREFERENCED_LOCAL_VARIABLE(xButton);
+			DBG_UNREFERENCED_LOCAL_VARIABLE(yButton);
+		}
+		else
+		{
+			// This controller is not available
+		}
+	}
 }
 
 int APIENTRY
@@ -286,73 +338,75 @@ wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR
 		NULL
 	))) return FALSE;
 
-    Running = true;
+	int samplesPerSec = 48000, toneHz = 256, toneVolume = 1000,
+		squareWavePeriod = samplesPerSec / toneHz,
+		halfSquareWavePeriod = squareWavePeriod / 2,
+		bytesPerSample = sizeof(int16_t) * 2,
+		soundBufferSize = samplesPerSec * bytesPerSample;
+	uint32_t sampleIndex = 0; // keeps going forever
+
+	InitDirectSound(hWnd, samplesPerSec, soundBufferSize);
+	IDirectSoundBuffer_Play(TheSoundBuffer, 0, 0, DSBPLAY_LOOPING);
+
+    ResizeDIBSection(&ThePixelBuffer, 1200, 720);
+    LoadXInput();
+
     int xoffset = 0, yoffset = 0;
     HDC drawCtx = GetDC(hWnd);
+    TheIsGameRunning = true;
 
-	InitDirectSound(hWnd, 48000, 48000 * sizeof(int16_t) * 2);
-    ResizeDIBSection(&buf, 1200, 720);
-    LoadXInput();
-    while (Running)
+    while (TheIsGameRunning)
     {
         MSG message;
         while (PeekMessage(&message, 0, 0, 0, PM_REMOVE))
         {
-            if (message.message == WM_QUIT) Running = false;
+            if (message.message == WM_QUIT) TheIsGameRunning = false;
 
             TranslateMessage(&message);
             DispatchMessage(&message);
         }
 
-        // Should we poll this more frequently?
-        for (DWORD ctrlIdx = 0; ctrlIdx  < XUSER_MAX_COUNT; ctrlIdx++)
-        {
-			XINPUT_STATE controllerState;
-			if (XInputGetStateStub(ctrlIdx, &controllerState) == ERROR_SUCCESS)
+		XInputLoop(&xoffset, &yoffset);
+        RenderWeirdGradient(&ThePixelBuffer, xoffset, yoffset);
+
+		DWORD playCursor, writeCursor;
+		if (SUCCEEDED(IDirectSoundBuffer_GetCurrentPosition(TheSoundBuffer, &playCursor, &writeCursor)))
+		{
+			DWORD bytesToWrite, byteToLock = sampleIndex * bytesPerSample % soundBufferSize;
+			if (byteToLock > playCursor)
 			{
-				// This controller is plugged in
-				// See if ControllerState dwPacketNumber increments too rapidly
-				XINPUT_GAMEPAD* pad = &controllerState.Gamepad;
-                bool up = pad->wButtons & XINPUT_GAMEPAD_DPAD_UP;
-                bool down = pad->wButtons & XINPUT_GAMEPAD_DPAD_DOWN;
-                bool left = pad->wButtons & XINPUT_GAMEPAD_DPAD_LEFT;
-                bool right = pad->wButtons & XINPUT_GAMEPAD_DPAD_RIGHT;
-                bool start = pad->wButtons & XINPUT_GAMEPAD_START;
-                bool back = pad->wButtons & XINPUT_GAMEPAD_BACK;
-                bool leftShoulder = pad->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER;
-                bool rightShoulder = pad->wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER;
-                bool aButton = pad->wButtons & XINPUT_GAMEPAD_A;
-                bool bButton = pad->wButtons & XINPUT_GAMEPAD_B;
-                bool xButton = pad->wButtons & XINPUT_GAMEPAD_X;
-                bool yButton = pad->wButtons & XINPUT_GAMEPAD_Y;
-
-                int16_t lStickX = pad->sThumbLX;
-                int16_t lStickY = pad->sThumbLY;
-
-                xoffset += lStickX >> 12;
-				yoffset += lStickY >> 12;
-
-                DBG_UNREFERENCED_LOCAL_VARIABLE(up);
-                DBG_UNREFERENCED_LOCAL_VARIABLE(down);
-                DBG_UNREFERENCED_LOCAL_VARIABLE(left);
-                DBG_UNREFERENCED_LOCAL_VARIABLE(right);
-                DBG_UNREFERENCED_LOCAL_VARIABLE(start);
-                DBG_UNREFERENCED_LOCAL_VARIABLE(back);
-                DBG_UNREFERENCED_LOCAL_VARIABLE(leftShoulder);
-                DBG_UNREFERENCED_LOCAL_VARIABLE(rightShoulder);
-                DBG_UNREFERENCED_LOCAL_VARIABLE(bButton);
-                DBG_UNREFERENCED_LOCAL_VARIABLE(aButton);
-                DBG_UNREFERENCED_LOCAL_VARIABLE(xButton);
-                DBG_UNREFERENCED_LOCAL_VARIABLE(yButton);
-            }
-			else
-			{
-				// This controller is not available
+				bytesToWrite = soundBufferSize - byteToLock;
+				bytesToWrite += playCursor;
 			}
-        }
-        RenderWeirdGradient(&buf, xoffset, yoffset);
+			else bytesToWrite = playCursor - byteToLock;
+
+			void *region1, *region2;
+			DWORD region1Size, region2Size;
+			if (SUCCEEDED(IDirectSoundBuffer_Lock(TheSoundBuffer, byteToLock, bytesToWrite, &region1, &region1Size, &region2, &region2Size, 0)))
+			{
+
+#define DS_BUF_REGION_WRITE_LOOP(region, regionSize)														\
+				{																							\
+					DWORD sampleCount = regionSize / bytesPerSample;										\
+					int16_t* sampleOut = (int16_t*)region;													\
+					for (DWORD sampleIdx = 0; sampleIdx < sampleCount; sampleIdx++)							\
+					{																						\
+						int16_t sampleValue =																\
+							((sampleIndex++ / halfSquareWavePeriod) % 2) ? toneVolume : -toneVolume;        \
+						*sampleOut++ = sampleValue;															\
+						*sampleOut++ = sampleValue;															\
+					}																						\
+				}
+
+				DS_BUF_REGION_WRITE_LOOP(region1, region1Size);
+				DS_BUF_REGION_WRITE_LOOP(region2, region2Size);
+
+				IDirectSoundBuffer_Unlock(TheSoundBuffer, region1, region1Size, region2, region2Size);
+			}
+		}
+
 		WindowDimension dimension = GetWindowDimension(hWnd);
-        DisplayBufferInWindow(&buf, dimension.width, dimension.height, drawCtx);
+        DisplayBufferInWindow(&ThePixelBuffer, dimension.width, dimension.height, drawCtx);
         xoffset += 1;
     }
 
