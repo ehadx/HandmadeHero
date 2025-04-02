@@ -1,10 +1,15 @@
 #include "framework.h"
 #include "BitmapBackBuffer.h"
 
-#define X_INPUT_GET_STATE(name) DWORD WINAPI name(DWORD dwUserIndex, XINPUT_STATE* pState)
+#define _USE_MATH_DEFINES
+#include <math.h>
+
+#define X_INPUT_GET_STATE(name) \
+	DWORD WINAPI name(DWORD dwUserIndex, XINPUT_STATE* pState)
 typedef X_INPUT_GET_STATE(XInputGetState_);
 
-#define X_INPUT_SET_STATE(name) DWORD WINAPI name(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
+#define X_INPUT_SET_STATE(name) \
+	DWORD WINAPI name(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
 typedef X_INPUT_SET_STATE(XInputSetState_);
 
 X_INPUT_GET_STATE(XInputGetStateStub)
@@ -24,7 +29,8 @@ X_INPUT_SET_STATE(XInputSetStateStub)
 static XInputSetState_* XInputSetState__;
 static XInputGetState_* XInputGetState__;
 
-#define DIRECT_SOUND_CREATE(name) HRESULT WINAPI name(LPCGUID pcGuidDevice, LPDIRECTSOUND* ppDS, LPUNKNOWN pUnkOuter)
+#define DIRECT_SOUND_CREATE(name) \
+	HRESULT WINAPI name(LPCGUID pcGuidDevice, LPDIRECTSOUND* ppDS, LPUNKNOWN pUnkOuter)
 typedef DIRECT_SOUND_CREATE(DirectSoundCreate_);
 
 static bool TheIsGameRunning;
@@ -248,7 +254,7 @@ WindowProcedure(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         break;
 
     default:
-        result = DefWindowProc(hWnd, message, wParam, lParam);
+        result = DefWindowProcA(hWnd, message, wParam, lParam);
         break;
     }
 
@@ -283,8 +289,8 @@ XInputLoop(int *xoffset, int *yoffset)
 			int16_t lStickX = pad->sThumbLX;
 			int16_t lStickY = pad->sThumbLY;
 
-			*xoffset += lStickX >> 12;
-			*yoffset += lStickY >> 12;
+			*xoffset += lStickX / 4096;
+			*yoffset += lStickY / 4096;
 
 			DBG_UNREFERENCED_LOCAL_VARIABLE(up);
 			DBG_UNREFERENCED_LOCAL_VARIABLE(down);
@@ -303,6 +309,49 @@ XInputLoop(int *xoffset, int *yoffset)
 		{
 			// This controller is not available
 		}
+	}
+}
+
+typedef struct
+{
+	int samplesPerSec;
+	int toneHz;
+	int16_t toneVolume;
+	uint32_t wavePeriod;
+	uint32_t bytesPerSample;
+	uint32_t soundBufferSize;
+	uint32_t sampleIndex;
+}
+SoundOutput;
+
+static void
+FillSoundBuffer(SoundOutput* soundOutput, DWORD byteToLock, DWORD bytesToWrite)
+{
+	void *region1, *region2;
+	DWORD region1Size, region2Size;
+	if (SUCCEEDED(IDirectSoundBuffer_Lock(
+		TheSoundBuffer, byteToLock, bytesToWrite, &region1, &region1Size, &region2, &region2Size, 0)))
+	{
+#define DS_BUF_REGION_WRITE_LOOP(region, regionSize)									\
+		{																				\
+			DWORD sampleCount = regionSize / soundOutput->bytesPerSample;				\
+			int16_t* sampleOut = (int16_t*)region;										\
+			for (DWORD sampleIdx = 0; sampleIdx < sampleCount; sampleIdx++)				\
+			{																			\
+				float t = 2.0f * M_PI *													\
+					(float)soundOutput->sampleIndex / (float)soundOutput->wavePeriod;	\
+				float sineValue = sinf(t); 												\
+				int16_t sampleValue = (int16_t)(sineValue * soundOutput->toneVolume);	\
+				*sampleOut++ = sampleValue;												\
+				*sampleOut++ = sampleValue;												\
+				soundOutput->sampleIndex++;												\
+			}																			\
+		}
+
+		DS_BUF_REGION_WRITE_LOOP(region1, region1Size);
+		DS_BUF_REGION_WRITE_LOOP(region2, region2Size);
+
+		IDirectSoundBuffer_Unlock(TheSoundBuffer, region1, region1Size, region2, region2Size);
 	}
 }
 
@@ -337,15 +386,21 @@ wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR
 		hInstance,
 		NULL
 	))) return FALSE;
+	
+	bool soundIsPlaying = false;
 
-	int samplesPerSec = 48000, toneHz = 256, toneVolume = 1000,
-		squareWavePeriod = samplesPerSec / toneHz,
-		halfSquareWavePeriod = squareWavePeriod / 2,
-		bytesPerSample = sizeof(int16_t) * 2,
-		soundBufferSize = samplesPerSec * bytesPerSample;
-	uint32_t sampleIndex = 0; // keeps going forever
+	SoundOutput soundOutput = {
+		.samplesPerSec = 48000,
+		.toneHz = 256,
+		.toneVolume = 1000,
+		.wavePeriod = soundOutput.samplesPerSec / soundOutput.toneHz,
+		.bytesPerSample = sizeof(int16_t) * 2,
+		.soundBufferSize = soundOutput.samplesPerSec * soundOutput.bytesPerSample,
+		.sampleIndex = 0
+	};
 
-	InitDirectSound(hWnd, samplesPerSec, soundBufferSize);
+	InitDirectSound(hWnd, soundOutput.samplesPerSec, soundOutput.soundBufferSize);
+	FillSoundBuffer(&soundOutput, 0, soundOutput.soundBufferSize);
 	IDirectSoundBuffer_Play(TheSoundBuffer, 0, 0, DSBPLAY_LOOPING);
 
     ResizeDIBSection(&ThePixelBuffer, 1200, 720);
@@ -370,41 +425,24 @@ wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR
         RenderWeirdGradient(&ThePixelBuffer, xoffset, yoffset);
 
 		DWORD playCursor, writeCursor;
-		if (SUCCEEDED(IDirectSoundBuffer_GetCurrentPosition(TheSoundBuffer, &playCursor, &writeCursor)))
+		if (!soundIsPlaying && 
+			SUCCEEDED(IDirectSoundBuffer_GetCurrentPosition(TheSoundBuffer, &playCursor, &writeCursor)))
 		{
-			DWORD bytesToWrite, byteToLock = sampleIndex * bytesPerSample % soundBufferSize;
-			if (byteToLock > playCursor)
+			DWORD bytesToWrite, 
+				byteToLock = soundOutput.sampleIndex * soundOutput.bytesPerSample % soundOutput.soundBufferSize;
+
+			if (byteToLock == playCursor)
+				bytesToWrite = 0;
+			else if (byteToLock > playCursor)
 			{
-				bytesToWrite = soundBufferSize - byteToLock;
+				bytesToWrite = soundOutput.soundBufferSize - byteToLock;
 				bytesToWrite += playCursor;
 			}
 			else bytesToWrite = playCursor - byteToLock;
 
-			void *region1, *region2;
-			DWORD region1Size, region2Size;
-			if (SUCCEEDED(IDirectSoundBuffer_Lock(TheSoundBuffer, byteToLock, bytesToWrite, &region1, &region1Size, &region2, &region2Size, 0)))
-			{
-
-#define DS_BUF_REGION_WRITE_LOOP(region, regionSize)														\
-				{																							\
-					DWORD sampleCount = regionSize / bytesPerSample;										\
-					int16_t* sampleOut = (int16_t*)region;													\
-					for (DWORD sampleIdx = 0; sampleIdx < sampleCount; sampleIdx++)							\
-					{																						\
-						int16_t sampleValue =																\
-							((sampleIndex++ / halfSquareWavePeriod) % 2) ? toneVolume : -toneVolume;        \
-						*sampleOut++ = sampleValue;															\
-						*sampleOut++ = sampleValue;															\
-					}																						\
-				}
-
-				DS_BUF_REGION_WRITE_LOOP(region1, region1Size);
-				DS_BUF_REGION_WRITE_LOOP(region2, region2Size);
-
-				IDirectSoundBuffer_Unlock(TheSoundBuffer, region1, region1Size, region2, region2Size);
-			}
+			FillSoundBuffer(&soundOutput, byteToLock, bytesToWrite);
 		}
-
+		
 		WindowDimension dimension = GetWindowDimension(hWnd);
         DisplayBufferInWindow(&ThePixelBuffer, dimension.width, dimension.height, drawCtx);
         xoffset += 1;
