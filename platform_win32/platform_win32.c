@@ -1,5 +1,5 @@
 #include "framework.h"
-#include "BitmapBackBuffer.h"
+#include "../game/game.h"
 
 #define _USE_MATH_DEFINES
 #include <math.h>
@@ -12,14 +12,14 @@ typedef X_INPUT_GET_STATE(XInputGetState_);
 	DWORD WINAPI name(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
 typedef X_INPUT_SET_STATE(XInputSetState_);
 
-X_INPUT_GET_STATE(XInputGetStateStub)
+static X_INPUT_GET_STATE(XInputGetStateStub)
 { 
     UNREFERENCED_PARAMETER(pState);
     UNREFERENCED_PARAMETER(dwUserIndex);
     return ERROR_DEVICE_NOT_CONNECTED;
 }
 
-X_INPUT_SET_STATE(XInputSetStateStub)
+static X_INPUT_SET_STATE(XInputSetStateStub)
 { 
     UNREFERENCED_PARAMETER(pVibration);
     UNREFERENCED_PARAMETER(dwUserIndex);
@@ -33,9 +33,58 @@ static XInputGetState_* XInputGetState__;
 	HRESULT WINAPI name(LPCGUID pcGuidDevice, LPDIRECTSOUND* ppDS, LPUNKNOWN pUnkOuter)
 typedef DIRECT_SOUND_CREATE(DirectSoundCreate_);
 
+typedef struct
+{
+	BITMAPINFO info;
+	PixelBackBuffer pixelsBuf;
+}
+BitmapBackBuffer;
+
 static bool TheIsGameRunning;
 static BitmapBackBuffer ThePixelBuffer;
 static LPDIRECTSOUNDBUFFER TheSoundBuffer;
+
+static void
+DisplayBufferInWindow(const BitmapBackBuffer* buf, LONG windowWidth, LONG windowHeight, HDC dc)
+{
+    StretchDIBits(
+        dc, 
+        0,
+        0,
+        windowWidth,
+        windowHeight,
+        0,
+        0,
+        buf->pixelsBuf.width,
+        buf->pixelsBuf.height,
+        buf->pixelsBuf.mem,
+        &buf->info,
+        DIB_RGB_COLORS,
+        SRCCOPY
+    );
+}
+
+#define BYTES_PER_PIXEL 4
+
+static void
+ResizeDIBSection(BitmapBackBuffer* buf, LONG width, LONG height)
+{
+    if (buf->pixelsBuf.mem) VirtualFree(buf->pixelsBuf.mem, 0, MEM_RELEASE);
+
+    buf->pixelsBuf.width = width;
+    buf->pixelsBuf.height = height;
+
+    buf->info.bmiHeader.biSize = sizeof(buf->info.bmiHeader);
+    buf->info.bmiHeader.biWidth = buf->pixelsBuf.width;
+    buf->info.bmiHeader.biHeight = buf->pixelsBuf.height;
+    buf->info.bmiHeader.biPlanes = 1;
+    buf->info.bmiHeader.biBitCount = 32; // DWORD aligne
+    buf->info.bmiHeader.biCompression = BI_RGB;
+
+    LONG bitmapMemorySize = buf->pixelsBuf.width * buf->pixelsBuf.height * BYTES_PER_PIXEL;
+    buf->pixelsBuf.mem = VirtualAlloc(0, bitmapMemorySize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+
 
 static void 
 LoadXInput(void)
@@ -262,7 +311,7 @@ WindowProcedure(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 }
 
 static void
-XInputLoop(int *xoffset, int *yoffset)
+XInputLoop(int *xoffset, int *yoffset, GameSoundOutput *soundOutput)
 {
 	// Should we poll this more frequently?
 	for (DWORD ctrlIdx = 0; ctrlIdx  < XUSER_MAX_COUNT; ctrlIdx++)
@@ -288,6 +337,8 @@ XInputLoop(int *xoffset, int *yoffset)
 
 			int16_t lStickX = pad->sThumbLX;
 			int16_t lStickY = pad->sThumbLY;
+
+			soundOutput->toneHz = 512 + (int)(256. * lStickY / 30000.0);
 
 			*xoffset += lStickX / 4096;
 			*yoffset += lStickY / 4096;
@@ -315,37 +366,35 @@ XInputLoop(int *xoffset, int *yoffset)
 typedef struct
 {
 	int samplesPerSec;
+	unsigned int sampleIndex;
+	int toneVolume;
 	int toneHz;
-	int16_t toneVolume;
-	uint32_t wavePeriod;
-	uint32_t bytesPerSample;
-	uint32_t soundBufferSize;
-	uint32_t sampleIndex;
+	int wavePeriod;
+	int bytesPerSample;
+	int soundBufferSize;
+	int latencySampleCount;
 }
 SoundOutput;
 
 static void
-FillSoundBuffer(SoundOutput* soundOutput, DWORD byteToLock, DWORD bytesToWrite)
+FillSoundBuffer(SoundOutput* soundOutput, GameSoundOutput* gameSoundOutput,  DWORD byteToLock, DWORD bytesToWrite)
 {
 	void *region1, *region2;
 	DWORD region1Size, region2Size;
 	if (SUCCEEDED(IDirectSoundBuffer_Lock(
 		TheSoundBuffer, byteToLock, bytesToWrite, &region1, &region1Size, &region2, &region2Size, 0)))
 	{
-#define DS_BUF_REGION_WRITE_LOOP(region, regionSize)									\
-		{																				\
-			DWORD sampleCount = regionSize / soundOutput->bytesPerSample;				\
-			int16_t* sampleOut = (int16_t*)region;										\
-			for (DWORD sampleIdx = 0; sampleIdx < sampleCount; sampleIdx++)				\
-			{																			\
-				float t = 2.0f * M_PI *													\
-					(float)soundOutput->sampleIndex / (float)soundOutput->wavePeriod;	\
-				float sineValue = sinf(t); 												\
-				int16_t sampleValue = (int16_t)(sineValue * soundOutput->toneVolume);	\
-				*sampleOut++ = sampleValue;												\
-				*sampleOut++ = sampleValue;												\
-				soundOutput->sampleIndex++;												\
-			}																			\
+#define DS_BUF_REGION_WRITE_LOOP(region, regionSize)								\
+		{																			\
+			DWORD regionSampleCount = regionSize / soundOutput->bytesPerSample;		\
+            int16_t* destSample = (int16_t*)region;									\
+			int16_t* sourceSample = (int16_t*)gameSoundOutput->sampleOut;			\
+			for (DWORD i = 0; i < regionSampleCount; i++)							\
+			{																		\
+				*destSample++ = *sourceSample++;									\
+				*destSample++ = *sourceSample++;									\
+				soundOutput->sampleIndex++;											\
+			}																		\
 		}
 
 		DS_BUF_REGION_WRITE_LOOP(region1, region1Size);
@@ -353,6 +402,29 @@ FillSoundBuffer(SoundOutput* soundOutput, DWORD byteToLock, DWORD bytesToWrite)
 
 		IDirectSoundBuffer_Unlock(TheSoundBuffer, region1, region1Size, region2, region2Size);
 	}
+}
+
+static void
+ClearSoundBuffer(int32_t soundBufferSize)
+{
+	VOID* region1, * region2;
+	DWORD region1Size, region2Size;
+	if (!SUCCEEDED(IDirectSoundBuffer_Lock(
+		TheSoundBuffer, 0, soundBufferSize, &region1, &region1Size, &region2, &region2Size, 0
+	)))
+	{
+		OutputDebugStringA("Cannot lock sound buffer\n");
+		return;
+	}
+	int8_t* sampleOut = (int8_t*)region1;
+	for (DWORD sampleIdx = 0; sampleIdx < region1Size; sampleIdx++)
+		*sampleOut++ = 0;
+
+	sampleOut = (int8_t*)region2;
+	for (DWORD sampleIdx = 0; sampleIdx < region2Size; sampleIdx++)
+		*sampleOut++ = 0;
+
+	IDirectSoundBuffer_Unlock(TheSoundBuffer, region1, region1Size, region2, region2Size);
 }
 
 int APIENTRY
@@ -368,6 +440,10 @@ wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR
 		.hInstance = hInstance,
 		.lpszClassName = L"HAND_MADE_HERO",
 	};
+
+	LARGE_INTEGER perfCountFrequencyResult;
+	QueryPerformanceFrequency(&perfCountFrequencyResult);
+	int64_t perfCountFrequency = perfCountFrequencyResult.QuadPart;
 
 	RegisterClassExW(&windowClass);
 
@@ -387,20 +463,19 @@ wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR
 		NULL
 	))) return FALSE;
 	
-	bool soundIsPlaying = false;
-
 	SoundOutput soundOutput = {
 		.samplesPerSec = 48000,
+		.sampleIndex = 0,
+		.toneVolume = 3000,
 		.toneHz = 256,
-		.toneVolume = 1000,
-		.wavePeriod = soundOutput.samplesPerSec / soundOutput.toneHz,
+		.wavePeriod = 48000 / 256,
 		.bytesPerSample = sizeof(int16_t) * 2,
-		.soundBufferSize = soundOutput.samplesPerSec * soundOutput.bytesPerSample,
-		.sampleIndex = 0
+		.soundBufferSize = 48000 * sizeof(int16_t) * 2,
+		.latencySampleCount = 48000 % 15,
 	};
-
+	int16_t* samples = VirtualAlloc(0, soundOutput.soundBufferSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 	InitDirectSound(hWnd, soundOutput.samplesPerSec, soundOutput.soundBufferSize);
-	FillSoundBuffer(&soundOutput, 0, soundOutput.soundBufferSize);
+	ClearSoundBuffer(soundOutput.soundBufferSize);
 	IDirectSoundBuffer_Play(TheSoundBuffer, 0, 0, DSBPLAY_LOOPING);
 
     ResizeDIBSection(&ThePixelBuffer, 1200, 720);
@@ -410,6 +485,9 @@ wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR
     HDC drawCtx = GetDC(hWnd);
     TheIsGameRunning = true;
 
+	LARGE_INTEGER lastCounter;
+	QueryPerformanceCounter(&lastCounter);
+	LONGLONG lastCycleCount = __rdtsc();
     while (TheIsGameRunning)
     {
         MSG message;
@@ -421,28 +499,56 @@ wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR
             DispatchMessage(&message);
         }
 
-		XInputLoop(&xoffset, &yoffset);
-        RenderWeirdGradient(&ThePixelBuffer, xoffset, yoffset);
+		XInputLoop(&xoffset, &yoffset, &TheSoundBuffer);
 
-		DWORD playCursor, writeCursor;
-		if (!soundIsPlaying && 
-			SUCCEEDED(IDirectSoundBuffer_GetCurrentPosition(TheSoundBuffer, &playCursor, &writeCursor)))
+		DWORD playCursor, writeCursor, byteToLock, targetCursor, bytesToWrite;
+		bool soundIsValid = false;
+		if (SUCCEEDED(IDirectSoundBuffer_GetCurrentPosition(TheSoundBuffer, &playCursor, &writeCursor)))
 		{
-			DWORD bytesToWrite, 
-				byteToLock = soundOutput.sampleIndex * soundOutput.bytesPerSample % soundOutput.soundBufferSize;
+			byteToLock = (soundOutput.sampleIndex * soundOutput.bytesPerSample) % soundOutput.soundBufferSize;
+			targetCursor = (playCursor + soundOutput.latencySampleCount * soundOutput.bytesPerSample) % soundOutput.soundBufferSize;
 
-			if (byteToLock == playCursor)
-				bytesToWrite = 0;
-			else if (byteToLock > playCursor)
+			if (byteToLock > targetCursor)
 			{
 				bytesToWrite = soundOutput.soundBufferSize - byteToLock;
-				bytesToWrite += playCursor;
+				bytesToWrite += targetCursor;
 			}
-			else bytesToWrite = playCursor - byteToLock;
+			else bytesToWrite = targetCursor - byteToLock;
 
-			FillSoundBuffer(&soundOutput, byteToLock, bytesToWrite);
+			soundIsValid = true;
 		}
+
+		GameSoundOutput gameSoundOutput = { 0 };
+		gameSoundOutput.sampleOut = samples;
+		gameSoundOutput.samplesPerSec = soundOutput.samplesPerSec;
+		gameSoundOutput.sampleCount = bytesToWrite / soundOutput.bytesPerSample;
+		gameSoundOutput.toneHz = soundOutput.toneHz;
+
+		GameUpdateAndRender(&ThePixelBuffer.pixelsBuf, xoffset, yoffset, &gameSoundOutput);
+
+		if (soundIsValid)
+			FillSoundBuffer(&soundOutput, &gameSoundOutput, byteToLock, bytesToWrite);
 		
+		LONGLONG endCycleCount = __rdtsc();
+		LARGE_INTEGER endCounter;
+		QueryPerformanceCounter(&endCounter);
+		LONGLONG cyclesElapsed = endCycleCount - lastCycleCount;
+		LONGLONG counterElapsed = endCounter.QuadPart - lastCounter.QuadPart;
+		LONGLONG millisecPerFrame = 1000 * counterElapsed / perfCountFrequency;
+		LONGLONG fps = perfCountFrequency / counterElapsed;
+		LONGLONG megaCyclesPerFrame = cyclesElapsed / (1000ll * 1000);
+
+		char buffer[256];
+		wsprintfA(buffer, "%I64dms/f, %I64dfps, %I64dmc/f\n",
+			millisecPerFrame, fps, megaCyclesPerFrame);
+		OutputDebugStringA(buffer);
+
+		// QueryPerformaceCounter does not always give us a consistent time because process
+		// can be interrupted by the OS, so we are always setting the lastCounter to the
+		// endCounter, so we can get a consistent time.
+		lastCounter = endCounter;
+		lastCycleCount = endCycleCount;
+
 		WindowDimension dimension = GetWindowDimension(hWnd);
         DisplayBufferInWindow(&ThePixelBuffer, dimension.width, dimension.height, drawCtx);
         xoffset += 1;
